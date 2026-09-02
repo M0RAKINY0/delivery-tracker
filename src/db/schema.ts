@@ -20,6 +20,7 @@ export const shipment =pgTable("shipment",{
     trackingNumber: varchar().unique(),
     pickupAddress: varchar().notNull(),
     dropOff: varchar().notNull(),
+    courierId: uuid().references(()=> userTable.id),
     status: varchar().notNull().default("pending"),
     currentLocation: text(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
