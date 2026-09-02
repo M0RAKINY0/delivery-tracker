@@ -1,2 +1,3 @@
 # delivery-tracker
-a  service that is used to track packages in real time. built with typesctipt
+a  service that is used to track packages in real time. 
+built with typesctipt using fastify, drizzle and a websocket

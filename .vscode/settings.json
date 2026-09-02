@@ -1,0 +1,6 @@
+{
+    "editor.tabCompletion": "off",
+    "editor.inlineSuggest.acceptOnTab": false,
+    "github.copilot.editor.enableAutoCompletions": false,
+    
+}

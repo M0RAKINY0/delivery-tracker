@@ -1,193 +1,92 @@
-# Fastify, a working introduction
+# Delivery tracking system, architecture
 
-This covers what you need to build the delivery tracking API. Not the whole framework, just the parts that come up in this project.
+## Purpose
 
-## Creating the instance
+The whole product is one thing: a customer sees their package's location on a map, updating in real time. A shipment gets created, a courier gets attached to it, the courier's phone sends location pings, and the customer's screen updates as those pings arrive. That's it. No matching algorithm, no multiple couriers competing for a shipment, no pricing. This project teaches you the fundamentals. The Uber MVP is a separate, later project that reuses some of these ideas and adds the harder problems on top, like matching and contention.
 
-Everything starts with one call. This instance is what you register routes and plugins on.
+## Tech stack
 
-```typescript
-import Fastify from 'fastify';
+- Node.js + TypeScript
+- Postgres for storage
+- Redis for caching and rate limiting
+- Socket.io for pushing live location updates to the browser
+- Leaflet or Mapbox for the map on the frontend
 
-const app = Fastify({
-  logger: true, // uses pino under the hood, matches the logging choice in the architecture doc
-});
-```
+## Recommended dependencies
 
-`logger: true` gives you structured request logs for free, method, URL, status code, response time, without adding anything yourself.
+- **Fastify over Express** for the HTTP layer. Fastify compiles a serializer per route from a schema instead of walking the response object with JSON.stringify on every call, which makes it measurably faster under load. Express works fine too, Fastify's just the better default if you want the practice.
+- **postgres.js over pg** for the Postgres client. Lower per-query overhead, and tagged template queries mean you get parameterized SQL without an ORM sitting in between.
+- **Drizzle**, on top of postgres.js. At three tables this is more setup than the project strictly needs, but you're using it to learn it, so that's fine. Define the schema in `src/db/schema.ts` with Drizzle's `pgTable`, and use `drizzle-orm/postgres-js` to get a typed query builder over the same postgres.js connection. Run `drizzle-kit generate` and `drizzle-kit migrate` instead of hand-writing `schema.sql`, so the schema in code stays the source of truth.
+- **ioredis over node-redis.** Better connection pooling once the rate limiter and cache invalidation are both hitting Redis from the same process.
+- **ws over Socket.io**, if you want to manage reconnection logic yourself and skip the extra framing protocol Socket.io adds. Socket.io is the easier path if you'd rather have room-based subscriptions handled for you. Genuine tradeoff, either is a reasonable pick.
+- **Zod** for request validation, paired with Fastify's schema compilation so validation and response shape share one definition instead of two.
+- **pino over the default console logger.** Structured, asynchronous JSON logging, useful once the location ping endpoint is getting hit every few seconds.
 
-## Routes
+## Startup guide
 
-A route is a method, a path, and a handler. The handler is an async function that gets `request` and `reply`.
+1. **Set up Postgres.** A free Supabase project or a local install both work fine, no extensions needed for this version.
+2. **Set up Redis.** A free Upstash instance, or `docker run -p 6379:6379 redis` locally.
+3. **Init the project.**
+   ```
+   mkdir delivery-tracking && cd delivery-tracking
+   npm init -y
+   npm install fastify postgres drizzle-orm ioredis ws zod pino
+   npm install -D typescript tsx @types/node drizzle-kit
+   npx tsc --init
+   ```
+4. **Set environment variables.** A `.env` with `DATABASE_URL`, `REDIS_URL`, and `PORT`. Load them with Node's built-in `--env-file` flag on Node 20+, or a small `dotenv` import otherwise.
+5. **Write the Drizzle schema.** Translate the tables from the data model section into `src/db/schema.ts` using `pgTable`. Add a `drizzle.config.ts` pointing at that file and your `DATABASE_URL`, then run `npx drizzle-kit generate` to produce the migration SQL and `npx drizzle-kit migrate` to apply it.
+6. **Write the entry file.** A single `src/server.ts` that boots Fastify, registers the endpoints as stubs returning 501, and listens on `PORT`. Confirm it boots with `npx tsx src/server.ts` before writing real logic.
+7. **Add a health check.** `GET /health` that runs `SELECT 1` against Postgres and pings Redis, returns 200 if both succeed. Catches connection mistakes before you build on top of them.
+8. **Implement the endpoints one at a time**, in the order listed below, replacing each stub as you go.
 
-```typescript
-app.get('/health', async (request, reply) => {
-  return { status: 'ok' };
-});
-```
+## Data model
 
-Returning a plain object is enough, Fastify serializes it to JSON and sets the content type for you. For more control over the status code, use `reply`:
-
-```typescript
-app.post('/shipments', async (request, reply) => {
-  const shipment = await createShipment(request.body);
-  return reply.code(201).send(shipment);
-});
-```
-
-`request` carries `request.body`, `request.params`, `request.query`, and `request.headers`. `reply` carries `reply.code()`, `reply.header()`, and `reply.send()`.
-
-## Schema validation with Zod
-
-This is the part that makes Fastify worth learning over Express. You define the shape of a request once, and get both runtime validation and TypeScript types from that one definition.
-
-Install the type provider:
-
-```
-npm install fastify-type-provider-zod zod
-```
-
-Set it up:
+Three tables, defined in `src/db/schema.ts`.
 
 ```typescript
-import Fastify from 'fastify';
-import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
-import { z } from 'zod';
+import { pgTable, uuid, text, doublePrecision, timestamp, index } from 'drizzle-orm/pg-core';
 
-const app = Fastify().withTypeProvider<ZodTypeProvider>();
-app.setValidatorCompiler(validatorCompiler);
-app.setSerializerCompiler(serializerCompiler);
-```
-
-Now routes take a `schema` object built from Zod, and `request.body` is typed automatically, no manual casting.
-
-```typescript
-const createShipmentSchema = z.object({
-  pickupAddress: z.string().min(1),
-  dropoffAddress: z.string().min(1),
+export const couriers = pgTable('couriers', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  name: text('name').notNull(),
 });
 
-app.post('/shipments', {
-  schema: {
-    body: createShipmentSchema,
-    response: {
-      201: z.object({
-        id: z.string().uuid(),
-        status: z.string(),
-      }),
-    },
-  },
-}, async (request, reply) => {
-  // request.body is typed as { pickupAddress: string; dropoffAddress: string }
-  const shipment = await createShipment(request.body);
-  return reply.code(201).send(shipment);
-});
-```
-
-If the request body doesn't match the schema, Fastify rejects it with a 400 before your handler code runs. You never write an `if (!pickupAddress) return reply.code(400)` check by hand.
-
-The `response` schema does two things. It validates what you're sending back, catching bugs where a handler returns the wrong shape, and it's what Fastify uses to compile the fast serializer mentioned in the architecture doc. Skipping it still works, but you lose the main performance benefit, so define it for every route.
-
-## Plugins
-
-Plugins are how you add anything beyond a single route: a database connection, a set of related routes, auth logic. Register with `app.register()`.
-
-```typescript
-import fp from 'fastify-plugin';
-
-async function dbPlugin(app: FastifyInstance) {
-  const db = drizzle(connectionString);
-  app.decorate('db', db);
-}
-
-app.register(fp(dbPlugin));
-```
-
-Wrapping with `fastify-plugin` (the `fp` import) is what makes a decorator like `app.db` visible outside the plugin's own scope. Without it, Fastify encapsulates the plugin, and `app.db` would only exist inside routes registered within that same plugin. This trips up almost everyone the first time, so it's worth remembering deliberately: encapsulated by default, `fp()` opts out of that.
-
-Once registered, every route handler can reach it:
-
-```typescript
-app.get('/shipments/:id', async (request, reply) => {
-  const { id } = request.params as { id: string };
-  const [shipment] = await app.db.select().from(shipments).where(eq(shipments.id, id));
-  return shipment;
-});
-```
-
-Organize routes as plugins too, once you have more than a handful. A `shipmentRoutes` plugin registered at a prefix keeps related endpoints grouped and versionable.
-
-```typescript
-async function shipmentRoutes(app: FastifyInstance) {
-  app.post('/shipments', { schema: { body: createShipmentSchema } }, async (request, reply) => {
-    // ...
-  });
-  app.get('/shipments/:id/track', async (request, reply) => {
-    // ...
-  });
-}
-
-app.register(shipmentRoutes, { prefix: '/api' });
-```
-
-## Hooks
-
-Hooks run code at fixed points in the request lifecycle, before validation, before the handler, after the response is sent. The one you'll use first is `onRequest`, for things like rate limiting or auth checks that should run before anything else.
-
-```typescript
-app.addHook('onRequest', async (request, reply) => {
-  request.log.info({ url: request.url }, 'incoming request');
-});
-```
-
-For the token bucket rate limiter on `POST /couriers/:id/location`, `@fastify/rate-limit` registers as a plugin and applies itself as a hook internally, you won't usually write the hook by hand for that case.
-
-## Error handling
-
-Throw a normal error inside an async handler and Fastify catches it, no try/catch boilerplate required per route.
-
-```typescript
-app.get('/shipments/:id', async (request, reply) => {
-  const { id } = request.params as { id: string };
-  const [shipment] = await app.db.select().from(shipments).where(eq(shipments.id, id));
-  if (!shipment) {
-    throw app.httpErrors.notFound('shipment not found');
-  }
-  return shipment;
-});
-```
-
-That uses `@fastify/sensible`, a small plugin that adds `app.httpErrors` with helpers like `.notFound()`, `.badRequest()`, `.conflict()`, useful for the 409 the state machine needs to return on an invalid transition.
-
-For anything not explicitly thrown as an HTTP error, set a global handler once:
-
-```typescript
-app.setErrorHandler((error, request, reply) => {
-  request.log.error(error);
-  reply.code(500).send({ error: 'internal server error' });
-});
-```
-
-## Starting the server
-
-```typescript
-app.listen({ port: Number(process.env.PORT) || 3000 }, (err, address) => {
-  if (err) {
-    app.log.error(err);
-    process.exit(1);
-  }
-});
-```
-
-## Full example, wiring it together
-
-This is roughly what `POST /shipments/:id/status` looks like once schema validation, the database, and error handling are all in place.
-
-```typescript
-const updateStatusSchema = z.object({
-  toStatus: z.enum(['picked_up', 'in_transit', 'delivered', 'failed']),
+export const shipments = pgTable('shipments', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  pickupAddress: text('pickup_address').notNull(),
+  dropoffAddress: text('dropoff_address').notNull(),
+  status: text('status').notNull().default('created'),
+  courierId: uuid('courier_id').references(() => couriers.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const locationPings = pgTable('location_pings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  courierId: uuid('courier_id').notNull().references(() => couriers.id),
+  latitude: doublePrecision('latitude').notNull(),
+  longitude: doublePrecision('longitude').notNull(),
+  recordedAt: timestamp('recorded_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  courierIdx: index('idx_location_pings_courier').on(table.courierId, table.recordedAt),
+}));
+```
+
+Plain latitude and longitude columns are enough here. No geospatial extension needed since there's no distance-based matching to do, that's the Uber MVP's job. Query through Drizzle's builder, for example `db.select().from(locationPings).where(eq(locationPings.courierId, id)).orderBy(desc(locationPings.recordedAt)).limit(20)` for the `/track` endpoint, rather than hand-written SQL strings.
+
+## State machine
+
+Five states: `created`, `picked_up`, `in_transit`, `delivered`, `failed`.
+
+```
+created    -> picked_up, failed
+picked_up  -> in_transit, failed
+in_transit -> delivered, failed
+delivered  -> (none)
+failed     -> (none)
+```
+
+```typescript
 const TRANSITIONS: Record<string, string[]> = {
   created: ['picked_up', 'failed'],
   picked_up: ['in_transit', 'failed'],
@@ -195,32 +94,51 @@ const TRANSITIONS: Record<string, string[]> = {
   delivered: [],
   failed: [],
 };
-
-app.post('/shipments/:id/status', {
-  schema: { body: updateStatusSchema },
-}, async (request, reply) => {
-  const { id } = request.params as { id: string };
-  const { toStatus } = request.body;
-
-  const [shipment] = await app.db.select().from(shipments).where(eq(shipments.id, id));
-  if (!shipment) throw app.httpErrors.notFound('shipment not found');
-
-  const allowed = TRANSITIONS[shipment.status] ?? [];
-  if (!allowed.includes(toStatus)) {
-    throw app.httpErrors.conflict(`cannot move from ${shipment.status} to ${toStatus}`);
-  }
-
-  await app.db.update(shipments).set({ status: toStatus }).where(eq(shipments.id, id));
-  return { id, status: toStatus };
-});
 ```
 
-## Common early mistakes
+Check every status update against this table before writing it. Reject anything not listed with a 409.
 
-Forgetting `fp()` on a plugin, then wondering why `app.db` is undefined in a route registered outside it.
+## API endpoints
 
-Skipping the `response` schema, then not getting the serialization speed Fastify is chosen for in the first place.
+Build these in order.
 
-Registering routes directly on `app` instead of grouping them into plugins once the route count grows past five or six, which makes the file hard to navigate later.
+1. `POST /shipments` — creates a shipment, status defaults to `created`.
+2. `POST /shipments/:id/assign` — sets `courier_id` on the shipment.
+3. `POST /couriers/:id/location` — inserts a row into `location_pings`.
+4. `POST /shipments/:id/status` — validates the transition against the state machine, updates `shipments.status`.
+5. `GET /shipments/:id/track` — returns current status plus the last 20 rows from `location_pings` for the assigned courier.
 
-Forgetting that `request.body` is untyped as `unknown` until you attach a schema. If a route has no `schema.body`, you're back to casting it by hand.
+## Real-time updates
+
+A client subscribes to a Socket.io room keyed by `shipment_id`. Whenever a new row lands in `location_pings` for that courier's shipment, or the status changes, emit an update to the room. The browser just listens and moves the pin, no polling.
+
+## Caching
+
+Cache `GET /shipments/:id/track` in Redis with a short TTL, invalidate it on any new ping or status change for that shipment. This is the endpoint that gets read constantly by anyone watching the map, so it's the one worth caching.
+
+## Rate limiting
+
+Apply a token bucket limiter to `POST /couriers/:id/location`, since that's the endpoint getting hit every few seconds by the courier's phone.
+
+## Build order
+
+**Week one:** the first four endpoints, no frontend. Test with curl or Postman.
+
+**Week two:** `/track`, then Socket.io so a subscribed client gets pushed updates.
+
+**Week three:** Redis caching on `/track`, rate limiting on the location ping endpoint.
+
+**Week four:** frontend map with a moving pin, using Leaflet or Mapbox.
+
+## Testing priorities
+
+- State machine: assert every invalid transition gets rejected, not just that valid ones succeed.
+- Location pings: seed a few pings for a courier, assert `/track` returns them in the right order and caps at 20.
+
+## Deployment
+
+Postgres on Supabase or any small managed instance. Redis on Upstash or self-hosted. The API runs on any standard Node host to start.
+
+## Relationship to the Uber MVP
+
+This project and the Uber MVP are separate builds, not phases of one system. This one teaches you the state machine, the real-time pipeline, and caching and rate limiting on a hot endpoint. The Uber MVP is where you'd add the parts this project skips on purpose: matching a rider to one of several available drivers by distance, handling contention when two riders want the same driver, and pricing. Start that one once this one is done and working, not before.
