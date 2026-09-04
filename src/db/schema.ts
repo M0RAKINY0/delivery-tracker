@@ -10,7 +10,7 @@ import {
 } from "drizzle-orm/pg-core";
 
 
-export const userTable = pgTable("Couriers",{
+export const Courier = pgTable("Couriers",{
     id: uuid("id").defaultRandom().primaryKey(),
     name: text(),
 });
@@ -20,7 +20,7 @@ export const shipment =pgTable("shipment",{
     trackingNumber: varchar().unique(),
     pickupAddress: varchar().notNull(),
     dropOff: varchar().notNull(),
-    courierId: uuid().references(()=> userTable.id),
+    courierId: uuid().references(()=> Courier.id),
     status: varchar().notNull().default("pending"),
     currentLocation: text(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
@@ -29,7 +29,7 @@ export const shipment =pgTable("shipment",{
 
 export const LocationPings = pgTable("real time location",{
     id: uuid(),
-    courierId: uuid().references(()=> userTable.id),
+    courierId: uuid().references(()=> Courier.id),
     longitude: doublePrecision("latitude"),
     latitude: doublePrecision("longitude"),
 });

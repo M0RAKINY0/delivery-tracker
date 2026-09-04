@@ -1,7 +1,13 @@
 import Fastify from "fastify";
 const app = Fastify({ logger: true });
+import {
+    getCourier,
+    getCurrentLocation,
+} from "./services/courier.service.js";
 
+app.get("/couriers", getCourier);
 
+app.get("/currentLocation", getCurrentLocation);
 app.get('/health', async (request, reply)=>{
     return {status: 'ok'};
 });
